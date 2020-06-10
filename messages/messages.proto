@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+message TaskDef {
+    string RequestID = 1;
+    string Executable = 2;
+    repeated string Args = 3;
+    repeated string Env = 4;
+    string Dir = 5;
+}
+
+message Registration {
+    string ip = 1;
+    string port = 2;
+}
+
+message Ack {
+    bool ok = 1;
+}
+
+message Empty {
+
+}
+
+service CronyTaskMaster {
+    rpc RunTask(TaskDef) returns (Ack) {}
+    rpc Ping(Empty) returns (Ack) {}
+}
+
+message TaskStatusMsg {
+    int32 status = 1;
+}
+
+service CronyTaskSlave {
+    rpc Register(Registration) returns (Empty) {}
+    rpc TaskStatus(TaskStatusMsg) returns (Ack) {}
+}
