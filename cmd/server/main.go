@@ -2,16 +2,17 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/labstack/echo"
-	"github.com/robfig/cron"
-	"github.com/rs/xid"
+	"github.com/robfig/cron/v3"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 
@@ -20,7 +21,6 @@ import (
 
 /*
 TODO:
-	- Add a job
 	- Pause a job
 	- Update a job
 	- Delete a job
@@ -39,8 +39,15 @@ const (
 	client_address   = "localhost:50051"
 )
 
+var StatusNames = map[int32]string{
+	0: "None",
+	1: "Started",
+	2: "Completed",
+	4: "Error",
+}
+
 type AJob struct {
-	JobID     string    `json:"job_id"`
+	JobID     int32    `json:"job_id"`
 	JobName   string    `json:"job_name"`
 	Cmd       string    `json:"cmd"`
 	Args      []string  `json:"args"`
@@ -50,15 +57,15 @@ type AJob struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-var AJobs map[string]AJob
+var AJobs map[int32]AJob
 var crn *cron.Cron
 
 func init() {
-	crn = cron.New()
+	crn = cron.New(cron.WithSeconds())
 }
 
 type TaskRunner struct {
-	JobId string
+	JobId int32
 }
 
 func (tr TaskRunner) Run() bool {
@@ -81,14 +88,22 @@ func (tr TaskRunner) Run() bool {
 	if err != nil {
 		log.Fatalf("could not greet: %v", err)
 	}
-	log.Infof("Task Status: %s", r.Ok)
+	log.Infof("Task received by slave: %t", r.Ok)
 	return true
 }
 
 func AddJob() {
-	jid := xid.New().String()
-	AJobs[jid] = AJob{
-		JobID:     jid,
+	tr := TaskRunner{}
+	eid, err := crn.AddFunc("00 * * * * *", func() { tr.Run() })
+	if err != nil {
+		log.Errorln(err.Error())
+		os.Exit(0)
+	}
+	tr.JobId = int32(eid)
+
+	AJobs[int32(eid)] = AJob{
+		JobID:     int32(eid),
+		JobName: "Test 0",
 		Cmd:       "sh",
 		Args:      []string{"test.sh"},
 		Schedule:  "00 * * * * *",
@@ -96,11 +111,7 @@ func AddJob() {
 		UpdatedAt: time.Now(),
 		CreatedAt: time.Now(),
 	}
-	err := crn.AddFunc(AJobs[jid].Schedule, func() { TaskRunner{JobId: jid}.Run() })
-	if err != nil {
-		log.Errorln(err.Error())
-		os.Exit(0)
-	}
+
 	crn.Start()
 }
 
@@ -112,7 +123,7 @@ func main() {
 		log.Infoln("Clean exit")
 	}()
 	log.SetFormatter(&log.JSONFormatter{})
-	AJobs = make(map[string]AJob)
+	AJobs = make(map[int32]AJob)
 	AddJob()
 	go runRESTServer()
 	go runGRPCServer()
@@ -125,7 +136,8 @@ func main() {
 type client struct{}
 
 func (c *client) TaskStatus(ctx context.Context, task *messages.TaskStatusMsg) (*messages.Ack, error) {
-	log.Printf("Received: %d\n", task.Status)
+	log.Printf("Received: %s/%s" +
+		"\n", AJobs[task.RequestID].JobName, StatusNames[task.Status])
 	return &messages.Ack{Ok: true}, nil
 }
 
@@ -154,8 +166,15 @@ func GetJobs(ctx echo.Context) error {
 }
 
 func GetAJob(ctx echo.Context) error {
-	jid := ctx.Param("jid")
-	return ctx.JSON(http.StatusOK, AJobs[jid])
+	jidStr := ctx.Param("jid")
+	jid, err := strconv.Atoi(jidStr)
+	if err != nil {
+		return err
+	}
+	if job, ok := AJobs[int32(jid)]; ok {
+		return ctx.JSON(http.StatusOK, job)
+	}
+	return ctx.JSON(http.StatusNotFound, map[string]string{"status": "not found"})
 }
 
 func AddAJob(ctx echo.Context) error {
@@ -163,22 +182,48 @@ func AddAJob(ctx echo.Context) error {
 	if err := ctx.Bind(&job); err != nil {
 		return err
 	}
-	job.JobID = xid.New().String()
+
+	tr := TaskRunner{}
+	eid, err := crn.AddFunc(job.Schedule, func() { tr.Run() })
+	if err != nil {
+		log.Errorln(err.Error())
+		os.Exit(0)
+	}
+	tr.JobId = int32(eid)
+
+	job.JobID = int32(eid)
 	job.Status = "New"
 	job.UpdatedAt = time.Now()
 	job.CreatedAt = time.Now()
 
 	AJobs[job.JobID] = job
+
 	return ctx.JSON(http.StatusOK, job)
+}
+
+func DeleteAJob(ctx echo.Context) error {
+	jidStr := ctx.Param("jid")
+	jid, err := strconv.Atoi(jidStr)
+	if err != nil {
+		return err
+	}
+	if _, ok := AJobs[int32(jid)]; ok {
+		crn.Remove(cron.EntryID(jid))
+		delete(AJobs, int32(jid))
+
+		return ctx.JSON(http.StatusOK, map[string]string{"deleted": fmt.Sprintf("job %d=ok", jid)})
+	}
+	return ctx.JSON(http.StatusNotFound, map[string]string{"status": "not found"})
 }
 
 func runRESTServer() {
 	c := echo.New()
 	c.HideBanner = true
 	c.HidePort = true
-	c.GET("/jobs", GetJobs)     // List all jobs
-	c.GET("/job/:jid", GetAJob) // List all jobs
-	c.POST("/jobs", AddAJob)
+	c.GET("/jobs", GetJobs)     	// List all jobs
+	c.GET("/jobs/:jid", GetAJob) 	// List all jobs
+	c.POST("/jobs", AddAJob) 		// Add a job to the job list
+	c.DELETE("/jobs/:jid", DeleteAJob)
 
 	c.Start(rest_server_port)
 }

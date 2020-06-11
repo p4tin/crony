@@ -17,7 +17,7 @@ const (
 	client_port    = ":50051"
 )
 
-func SendTaskStatus(status int32) {
+func SendTaskStatus(TaskID int32, status int32) {
 	conn, err := grpc.Dial(server_address, grpc.WithInsecure(), grpc.WithBlock())
 	if err != nil {
 		log.Fatalf("did not connect: %v", err)
@@ -27,11 +27,11 @@ func SendTaskStatus(status int32) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	r, err := c.TaskStatus(ctx, &messages.TaskStatusMsg{Status: status})
+	r, err := c.TaskStatus(ctx, &messages.TaskStatusMsg{RequestID: TaskID, Status: status})
 	if err != nil {
 		log.Fatalf("could not greet: %v", err)
 	}
-	log.Printf("Task Status: %s", r.Ok)
+	log.Printf("Task Status: %t", r.Ok)
 }
 
 func runTask(task *messages.TaskDef) {
@@ -41,7 +41,7 @@ func runTask(task *messages.TaskDef) {
 		log.Fatalf("cmd.Run() failed with %s\n", err)
 	}
 	log.Infof("combined out:\n%s\n", string(out))
-	SendTaskStatus(2)
+	SendTaskStatus(task.RequestID, 2)
 }
 
 type server struct {
